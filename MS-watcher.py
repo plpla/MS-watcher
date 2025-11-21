@@ -1,5 +1,5 @@
 import pyautogui
-import pytesseract
+from ollama import Client
 from PIL import Image
 import requests
 import time
@@ -9,10 +9,10 @@ from tkinter import scrolledtext, messagebox
 import threading
 import os
 import json
-
+import base64
 
 CONFIG_PATH = "config.json"
-
+pyautogui.FAILSAFE = False
 
 def load_config():
     if not os.path.exists(CONFIG_PATH):
@@ -20,9 +20,10 @@ def load_config():
             "teams_webhook_url": "",
             "wait_interval": 30,
             "keyword": "Error",
-            "ocr_language": "eng",
-            "instrument": "Thermo Fusion",
-            "tesseract": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+            "model": "qwen2.5vl:7b",
+            "ollama_url": "http://127.0.0.1:11434/api/generate",
+            "instrument": "UNKNOWN INSTRUMENT",
+            "prompt_file": "PROMPT_FILE.txt"
         }
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(config_defaut, f, indent=4)
@@ -32,21 +33,15 @@ def load_config():
         return json.load(f)
     
 config = load_config()
-TEAMS_WEBHOOK_URL = config.get("teams_webhook_url", "")
-WAIT_INTERVAL = config.get("wait_interval", 30)
-KEYWORDS = config.get("keywords", "Error")
-OCR_LANGUAGE = config.get("ocr_language", "eng")
-INSTRUMENT = config.get("instrument", "UNKNOW")
-TESSERACT = config.get("tesseract", None)
+TEAMS_WEBHOOK_URL = config.get("teams_webhook_url")
+WAIT_INTERVAL = config.get("wait_interval")
+INSTRUMENT = config.get("instrument")
+URL = config.get("ollama_url")
+PROMPT_FILE = config.get("prompt_file")
+MODEL = config.get("model")
 
-if TESSERACT is None:
-    print("Install Tesseract and fill config")
-    exit()
-pytesseract.pytesseract.tesseract_cmd = TESSERACT
-
-
-def perform_ocr(zone=None):
-    """Perform a screenshot and OCR"""
+def perform_vision(log_callback, zone=None):
+    """Takes a screenshot from a zone and send it to Ollama for interpretation"""
     screenshot_path = "capture.png"
     if zone:
         x, y, w, h = zone
@@ -54,34 +49,9 @@ def perform_ocr(zone=None):
     else:
         image = pyautogui.screenshot()
     image.save(screenshot_path)
-    texte = pytesseract.image_to_string(image, lang=OCR_LANGUAGE)
-    return texte.strip()
-
-def analyze_text(text, log_callback):
-    """Look for LC and MS status in the text."""
-    print(text)
-    print(f"Instrument: {INSTRUMENT}")
-    if INSTRUMENT=="Fusion" or INSTRUMENT=="Exploris":
-        #It's a Thermo Scientific instrument. We are watching Xcalibur left pannel.
-        split_text = text.split("\n")
-        LC_status_header_index = [i for i, j in enumerate(split_text) if "Thermo Scientific" in j]
-        #print(f"LC STATUS HEADER INDEX: {LC_status_header_index}")
-        if len(LC_status_header_index) == 0:
-            log_callback("ERROR: Cannot read LC status")
-            notify_teams(INSTRUMENT, {"ERROR": "Cannot read LC status"}, log_callback)
-            return
-        LC_status_index = LC_status_header_index[0] + 1
-        MS_status_header_index = [i for i, j in enumerate(split_text) if "Orbitrap" in j]
-        if len(MS_status_header_index) == 0:
-            log_callback("ERROR: Cannot read MS status")
-            notify_teams(INSTRUMENT, {"ERROR": "Cannot read MS status"}, log_callback)
-            return
-        MS_status_index = MS_status_header_index[0] + 1
-        messages = {"LC status": split_text[LC_status_index], "MS status": split_text[MS_status_index]}
-        log_callback(f"LC Status: {split_text[LC_status_index]}")
-        log_callback(f"MS Status: {split_text[MS_status_index]}")
-        notify_teams(INSTRUMENT, messages, log_callback)
-    
+    result = analyze_image_ollama(screenshot_path, log_callback, url = URL)
+    print(result)
+    notify_teams(INSTRUMENT, result, log_callback)
 
 def notify_teams(sender, messages, log_callback):
     payload = {
@@ -121,28 +91,59 @@ def notify_teams(sender, messages, log_callback):
         ]
     }
     #Add message content
-    for title in messages:
-        payload["attachments"][0]["content"]["body"][1]["facts"].append({"title": title, "value": messages[title]})
+    payload["attachments"][0]["content"]["body"][1]["facts"].append({"title": "Status", "value": messages})
 
     try:
         r = requests.post(TEAMS_WEBHOOK_URL, json=payload)
         if r.status_code == 200 or r.status_code == 202:
             log_callback("Notification sent!")
         else:
-            log_callback(f"🚨 Teams notification error : {r.status_code} - {r.text}")
+            log_callback(f"Teams notification error : {r.status_code} - {r.text}")
     except Exception as e:
-        log_callback("🚨Teams notification error :", e)
+        log_callback("Teams notification error :", e)
+
+
+def analyze_image_ollama(screenshot_path, log_callback, url=URL):
+    
+    with open(screenshot_path, "rb") as screenshot:
+        images_to_bytes = base64.b64encode(screenshot.read())
+
+    prompt = ""
+    with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+        prompt = f.read()
+
+    if prompt == "":
+        print(f"Error: prompt is empty")
+        return {"state": "error", "summary": "LLM prompt is empty"}
+    
+    payload = {
+        "model": MODEL,
+        "prompt": prompt,
+        "images": [images_to_bytes.decode('utf-8')],
+        "stream": False
+    }
+    try:
+        log_callback("Sending screenshot to Ollama...")
+        r = requests.post(url, json=payload, timeout=300)
+        r.raise_for_status()
+        result = r.json()
+        response_text = str(result.get("response", "").strip())
+        #print(response_text)
+        log_callback("Got an answer!")
+        return response_text
+    except Exception as e:
+        print(f"Error Ollama: {e}")
+        return {"state": "error", "summary": str(e)}
+
 
 def auto_loop(stop_event, log_callback, zone):
-    log_callback(f"=== 🦕 Watcher started every ~{WAIT_INTERVAL} min) 🦕 ===")
+    log_callback(f"=== Watcher started every ~{WAIT_INTERVAL} min) ===")
     while not stop_event.is_set():
-        texte = perform_ocr(zone)
-        log_callback("\n--- OCR ---")
-        log_callback(texte[:400] + "...\n")
-        analyze_text(texte, log_callback)
+        perform_vision(log_callback, zone)
         if stop_event.wait(WAIT_INTERVAL * 60):
             break
-    log_callback("🛑 Watcher stopped.")
+    log_callback("Watcher stopped.")
+
 
 class MS_Watcher:
     # --- Fonctions UI ---
@@ -150,7 +151,7 @@ class MS_Watcher:
         self.root = root
         self.root.title("MS Watcher")
         self.root.geometry("720x520")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
 
         self.zone = None
         self.stop_event = threading.Event()
@@ -170,7 +171,6 @@ class MS_Watcher:
 
         self.stop_button = tk.Button(frame, text="⏹️ Stop", width=15, command=self.stop, state='disabled')
         self.stop_button.pack(side=tk.LEFT, padx=5)
-
 
     def log(self, message):
         self.log_box.config(state='normal')
@@ -249,3 +249,10 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = MS_Watcher(root)
     root.mainloop()
+    #test = check_screen_conformity("Thermo")
+    #print(test)
+    #result = analyze_image_ollama("captureTest.png", url = "http://132.203.28.74:11434/api/generate")
+    #result = analyze_image_ollama("Capture_Synapt.png", url = "http://132.203.28.74:11434/api/generate")
+    #result = analyze_image_ollama("capture_unknown.png", url = "http://132.203.28.74:11434/api/generate")
+    #result = analyze_image_ollama("capture.png", url = "http://132.203.28.74:11434/api/generate")
+    #print(result)
