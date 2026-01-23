@@ -91,6 +91,14 @@ def notify_teams(sender, messages, log_callback):
         ]
     }
     #Add message content
+    if messages is None:
+        messages = "No status available"
+    elif not isinstance(messages, str):
+        messages = str(messages)
+
+    # Limit length
+    messages = messages[:1000]
+
     payload["attachments"][0]["content"]["body"][1]["facts"].append({"title": "Status", "value": messages})
 
     try:
