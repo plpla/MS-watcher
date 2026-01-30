@@ -1,5 +1,5 @@
 import pyautogui
-from ollama import Client
+from openai import AzureOpenAI
 from PIL import Image
 import requests
 import time
@@ -20,8 +20,10 @@ def load_config():
             "teams_webhook_url": "",
             "wait_interval": 30,
             "keyword": "Error",
-            "model": "qwen2.5vl:7b",
-            "ollama_url": "http://127.0.0.1:11434/api/generate",
+            "azure_endpoint": "ENDPOINT",
+            "azure_api_key": "YOUR_API_KEY",
+            "azure_deployment": "MODEL",
+            "azure_api_version": "2024-12-01-preview",
             "instrument": "UNKNOWN INSTRUMENT",
             "prompt_file": "PROMPT_FILE.txt"
         }
@@ -36,9 +38,19 @@ config = load_config()
 TEAMS_WEBHOOK_URL = config.get("teams_webhook_url")
 WAIT_INTERVAL = config.get("wait_interval")
 INSTRUMENT = config.get("instrument")
-URL = config.get("ollama_url")
+AZURE_ENDPOINT = config.get("azure_endpoint")
+AZURE_API_KEY = config.get("azure_api_key")
+AZURE_DEPLOYMENT = config.get("azure_deployment")
+AZURE_API_VERSION = config.get("azure_api_version")
 PROMPT_FILE = config.get("prompt_file")
-MODEL = config.get("model")
+
+
+client = AzureOpenAI(
+    api_key=AZURE_API_KEY,
+    api_version=AZURE_API_VERSION,
+    azure_endpoint=AZURE_ENDPOINT
+)
+
 
 def perform_vision(log_callback, zone=None):
     """Takes a screenshot from a zone and send it to Ollama for interpretation"""
@@ -49,7 +61,7 @@ def perform_vision(log_callback, zone=None):
     else:
         image = pyautogui.screenshot()
     image.save(screenshot_path)
-    result = analyze_image_ollama(screenshot_path, log_callback, url = URL)
+    result = analyze_image_azure(screenshot_path, log_callback)
     print(result)
     notify_teams(INSTRUMENT, result, log_callback)
 
@@ -111,7 +123,78 @@ def notify_teams(sender, messages, log_callback):
         log_callback("Teams notification error :", e)
 
 
-def analyze_image_ollama(screenshot_path, log_callback, url=URL):
+
+def analyze_image_azure(screenshot_path, log_callback):
+    """Analyze image using Azure OpenAI Vision API with the OpenAI module"""
+    
+    # Read and encode the image
+    with open(screenshot_path, "rb") as screenshot:
+        image_data = base64.b64encode(screenshot.read()).decode('utf-8')
+    
+    # Read the prompt
+    prompt = ""
+    with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+        prompt = f.read()
+
+    if prompt == "":
+        print(f"Error: prompt is empty")
+        return {"state": "error", "summary": "Prompt is empty"}
+    
+    try:
+        log_callback("Sending screenshot to Azure Vision...")
+        log_callback(f"Using model: {AZURE_DEPLOYMENT}")
+        log_callback(f"Prompt length: {len(prompt)} characters")
+        #log_callback(f"Image size: {len(image_data)} bytes (base64)")
+        
+        response = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_data}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_completion_tokens=4000 # TODO: add this parameter to the config.json
+        )
+        
+        log_callback(f"Response received. Choices: {len(response.choices)}")
+        
+        if not response.choices:
+            log_callback("WARNING: No choices in response!")
+            return "No response choices available"
+        
+        response_text = response.choices[0].message.content
+        
+        if response_text is None:
+            log_callback("WARNING: Response content is None!")
+            return "Empty response from Azure"
+        
+        response_text = response_text.strip()
+        log_callback(f"Response length: {len(response_text)} characters")
+        print(f"Full response: {response_text}")
+        log_callback("Got an answer from Azure!")
+        return response_text
+        
+    except Exception as e:
+        error_msg = f"Error Azure Vision: {type(e).__name__}: {str(e)}"
+        print(error_msg)
+        log_callback(error_msg)
+        return f"Error: {str(e)}"
+
+
+
+""" def analyze_image_ollama(screenshot_path, log_callback, url=URL):
     
     with open(screenshot_path, "rb") as screenshot:
         images_to_bytes = base64.b64encode(screenshot.read())
@@ -136,12 +219,12 @@ def analyze_image_ollama(screenshot_path, log_callback, url=URL):
         r.raise_for_status()
         result = r.json()
         response_text = str(result.get("response", "").strip())
-        #print(response_text)
+        print(response_text)
         log_callback("Got an answer!")
         return response_text
     except Exception as e:
         print(f"Error Ollama: {e}")
-        return {"state": "error", "summary": str(e)}
+        return {"state": "error", "summary": str(e)} """
 
 
 def auto_loop(stop_event, log_callback, zone):
